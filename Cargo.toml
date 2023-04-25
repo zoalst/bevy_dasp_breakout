@@ -7,4 +7,6 @@ edition = "2021"
 
 [dependencies]
 bevy = "0.10.1"
+cpal = "0.12"
 dasp = { version = "0.11.0", features = ["all"] }
+rand = "0.8.5"

@@ -6,6 +6,14 @@ use bevy::{
     sprite::MaterialMesh2dBundle,
 };
 
+// For using dasp audio
+use cpal;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use dasp::{signal, Sample, Signal};
+use std::sync::mpsc;
+use std::thread;
+use rand::Rng;
+
 // Defines the amount of time that should elapse between each physics step.
 const TIME_STEP: f32 = 1.0 / 60.0;
 
@@ -94,9 +102,6 @@ struct CollisionEvent;
 #[derive(Component)]
 struct Brick;
 
-#[derive(Resource)]
-struct CollisionSound(Handle<AudioSource>);
-
 // This bundle is a collection of the components that define a "wall" in our game
 #[derive(Bundle)]
 struct WallBundle {
@@ -184,10 +189,6 @@ fn setup(
 ) {
     // Camera
     commands.spawn(Camera2dBundle::default());
-
-    // Sound
-    let ball_collision_sound = asset_server.load("sounds/breakout_collision.ogg");
-    commands.insert_resource(CollisionSound(ball_collision_sound));
 
     // Paddle
     let paddle_y = BOTTOM_WALL + GAP_BETWEEN_PADDLE_AND_FLOOR;
@@ -410,13 +411,92 @@ fn check_for_collisions(
 
 fn play_collision_sound(
     mut collision_events: EventReader<CollisionEvent>,
-    audio: Res<Audio>,
-    sound: Res<CollisionSound>,
 ) {
-    // Play a sound once per frame if a collision occurred.
+    // Generate a sound once per frame if a collision occurred.
     if !collision_events.is_empty() {
         // This prevents events staying active on the next frame.
         collision_events.clear();
-        audio.play(sound.0.clone());
+        // Generate and play dasp in it's own thread
+        thread::spawn(move || {
+            play_dasp();
+        });
+        
+    }
+}
+
+fn play_dasp() {
+    // Setup dasp audio
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .expect("failed to find a default output device");
+    let config = device.default_output_config().unwrap();
+
+    match config.sample_format() {
+        cpal::SampleFormat::F32 => run_dasp::<f32>(&device, &config.into()),
+        cpal::SampleFormat::I16 => run_dasp::<i16>(&device, &config.into()),
+        cpal::SampleFormat::U16 => run_dasp::<u16>(&device, &config.into()),
+    }
+}
+
+fn run_dasp<T>(device: &cpal::Device, config: &cpal::StreamConfig)
+where
+    T: cpal::Sample,
+{
+    // Define the frequencies of the notes in the C Major scale
+    let c_major_scale = [261.63, 293.66, 329.63, 349.23, 392.00, 440.00, 493.88];
+    // Generate a random index for the note within the scale
+    let note_index = rand::thread_rng().gen_range(0..c_major_scale.len());
+    // Return the frequency of the random note
+    let freq = c_major_scale[note_index];
+    // Create a signal chain to play back 1 second of sine oscillator at a random note in C Major.
+    let hz = signal::rate(config.sample_rate.0 as f64).const_hz(freq);
+    let one_sec = config.sample_rate.0 as usize;
+    let mut synth = hz
+        .clone()
+        .sine()
+        .take(one_sec)
+        .map(|s| s.to_sample::<f32>() * 0.2);
+
+    // A channel for indicating when playback has completed.
+    let (complete_tx, complete_rx) = mpsc::sync_channel(1);
+
+    // Create and run the stream.
+    let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+    let channels = config.channels as usize;
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            write_dasp_data(data, channels, &complete_tx, &mut synth)
+        },
+        err_fn,
+    ).unwrap();
+    stream.play().unwrap();
+
+    // Wait for playback to complete.
+    complete_rx.recv().unwrap();
+    stream.pause().unwrap();
+}
+
+fn write_dasp_data<T>(
+    output: &mut [T],
+    channels: usize,
+    complete_tx: &mpsc::SyncSender<()>,
+    signal: &mut dyn Iterator<Item = f32>,
+) where
+    T: cpal::Sample,
+{
+    for frame in output.chunks_mut(channels) {
+        let sample = match signal.next() {
+            None => {
+                complete_tx.try_send(()).ok();
+                0.0
+            }
+            Some(sample) => sample,
+        };
+        let value: T = cpal::Sample::from::<f32>(&sample);
+        for sample in frame.iter_mut() {
+            *sample = value;
+        }
     }
 }
